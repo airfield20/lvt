@@ -38,7 +38,6 @@
 #include <nav_msgs/Odometry.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <std_srvs/Empty.h>
-#include <tf2_eigen/tf2_eigen.h>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -73,7 +72,7 @@ private:
 
     tf2::Transform m_base_to_odom, m_base_to_sensor;
     lvt_matrix33 m_rot_fix; // to align the poses so that z-axis is up and x-axis to the front.
-    lvt_matrix33 m_last_rotation;
+    lvt_quaternion m_last_rotation;
     lvt_vector3 m_last_position;
     ros::Time m_last_update_time;
     bool m_reset_pose_on_lost_vo; // in case when vo is lost and reset you want to continue accumelating poses from where you left off
@@ -89,7 +88,7 @@ private:
 lvt_ros::lvt_ros(const std::string &img_transport)
         : m_vo_system(nullptr), m_tf_listener(m_tf_buffer)
 {
-    m_rot_fix = Eigen::AngleAxisd(-1.57079632679, Eigen::Vector3d::UnitZ()).toRotationMatrix() * Eigen::AngleAxisd(-1.57079632679, Eigen::Vector3d::UnitX()).toRotationMatrix();
+    m_rot_fix.setIdentity();// = Eigen::AngleAxisd(-1.57079632679, Eigen::Vector3d::UnitZ()).toRotationMatrix() * Eigen::AngleAxisd(-1.57079632679, Eigen::Vector3d::UnitX()).toRotationMatrix();
     m_base_to_odom.setIdentity();
     m_base_to_sensor.setIdentity();
     m_last_rotation = m_rot_fix;
@@ -200,17 +199,19 @@ bool lvt_ros::reset_vo(std_srvs::Empty::Request &, std_srvs::Empty::Response &)
 
 void lvt_ros::init_transforms()
 {
-    std::string error_msg;
-    if (m_tf_buffer.canTransform(m_baselink_frame_id, m_camera_frame_id, ros::Time(), &error_msg))
-    {
-        tf2::fromMsg(m_tf_buffer.lookupTransform(m_baselink_frame_id, m_camera_frame_id, ros::Time()).transform, m_base_to_sensor);
-    }
-    else
-    {
-        ROS_WARN_THROTTLE(10.0, "Cannot transform from '%s' to '%s'. Will assume identity.", m_baselink_frame_id.c_str(), m_camera_frame_id.c_str());
-        ROS_DEBUG("Transform error: %s", error_msg.c_str());
-        m_base_to_sensor.setIdentity();
-    }
+     std::string error_msg;
+     if (m_tf_buffer.canTransform(m_baselink_frame_id, m_camera_frame_id, ros::Time(), &error_msg))
+     {
+     	tf2::fromMsg(m_tf_buffer.lookupTransform(m_baselink_frame_id, m_camera_frame_id, ros::Time(), ros::Duration(15)).transform, m_base_to_sensor);
+     }
+     else
+     {
+     	ROS_WARN_THROTTLE(10.0, "Cannot transform from '%s' to '%s'. Will assume identity.", m_baselink_frame_id.c_str(), m_camera_frame_id.c_str());
+     	ROS_DEBUG("Transform error: %s", error_msg.c_str());
+     	m_base_to_sensor.setIdentity();
+     }
+
+    m_base_to_sensor.setIdentity();
 }
 
 void lvt_ros::on_stereo_image(
@@ -254,46 +255,69 @@ void lvt_ros::on_stereo_image(
         return;
     }
 
-    const lvt_matrix33 current_rotation_mtrx = m_rot_fix * sl_pose.get_orientation_matrix();
-    const lvt_matrix33 rot_delta = current_rotation_mtrx * m_last_rotation.transpose();
-    const lvt_quaternion delta_q = lvt_quaternion(rot_delta);
-    const lvt_vector3 current_pos = m_rot_fix * sl_pose.get_position();
-    const lvt_vector3 pos_delta = current_pos - m_last_position;
+    //  const lvt_matrix33 current_rotation_mtrx =  sl_pose.get_orientation_matrix();
 
-
+    lvt_quaternion current_q2 = sl_pose.get_orientation_quaternion();
+    //  const lvt_matrix33 rot_delta = current_rotation_mtrx * m_last_rotation.transpose();
+     const lvt_quaternion delta_q = current_q2 * m_last_rotation.inverse();
+     const lvt_vector3 current_pos = sl_pose.get_position();
+     const lvt_vector3 pos_delta = current_pos - m_last_position;
 
     tf2::Transform delta_odom_sensor_tf;
-    delta_odom_sensor_tf.setOrigin(tf2::Vector3(pos_delta.x(), pos_delta.y(), pos_delta.z()));
-    geometry_msgs::Quaternion conversion = 
-        tf2::toMsg(Eigen::Quaternion<double>(delta_q.x(), delta_q.y(), delta_q.z(), delta_q.w()));
-    tf2::Quaternion tfconv;
-    tf2::convert(conversion,tfconv);
-    delta_odom_sensor_tf.setRotation(tfconv);
+     delta_odom_sensor_tf.setOrigin(tf2::Vector3(pos_delta.z(), -pos_delta.x(), -pos_delta.y()));
+     delta_odom_sensor_tf.setRotation(tf2::Quaternion(delta_q.z(), -delta_q.x(), -delta_q.y(), delta_q.w()));
 
-    tf2::Transform delta_odom_base_tf = m_base_to_sensor * delta_odom_sensor_tf * m_base_to_sensor.inverse();
-    m_base_to_odom = m_base_to_odom * delta_odom_base_tf;
+    lvt_vector3 current_position = sl_pose.get_position();
+    lvt_quaternion current_q = sl_pose.get_orientation_quaternion();
+    geometry_msgs::Transform pose_msg;
+    // You can uncomment the following to test with the coordinate correction
+     pose_msg.translation.x = current_position.z();
+     pose_msg.translation.y = -current_position.x();
+     pose_msg.translation.z = -current_position.y();
+     pose_msg.rotation.x = current_q.z();
+     pose_msg.rotation.y = -current_q.x();
+     pose_msg.rotation.z = -current_q.y();
+     pose_msg.rotation.w = current_q.w();
+//    pose_msg.translation.x = current_position.x();
+//    pose_msg.translation.y = current_position.y();
+//    pose_msg.translation.z = current_position.z();
+//    pose_msg.rotation.x = current_q.x();
+//    pose_msg.rotation.y = current_q.y();
+//    pose_msg.rotation.z = current_q.z();
+//    pose_msg.rotation.w = current_q.w();
+
+//    tf2::fromMsg(deltaTransf, delta_odom_sensor_tf);
+
+    // tf2::Transform delta_odom_base_tf = m_base_to_sensor * delta_odom_sensor_tf * m_base_to_sensor.inverse();
+    //      m_base_to_odom = m_base_to_odom * delta_odom_base_tf;
     nav_msgs::Odometry odometry_msg;
     odometry_msg.header.stamp = timestamp;
     odometry_msg.header.frame_id = m_odom_frame_id;
     odometry_msg.child_frame_id = m_baselink_frame_id;
-    geometry_msgs::Transform base2odom = tf2::toMsg(m_base_to_odom);
-    odometry_msg.pose.pose.position.x = base2odom.translation.x;
-    odometry_msg.pose.pose.position.y = base2odom.translation.y;
-    odometry_msg.pose.pose.position.z = base2odom.translation.z;
-    odometry_msg.pose.pose.orientation.x = base2odom.rotation.x;
-    odometry_msg.pose.pose.orientation.y = base2odom.rotation.y;
-    odometry_msg.pose.pose.orientation.z = base2odom.rotation.z;
-    odometry_msg.pose.pose.orientation.w = base2odom.rotation.w;
+    //geometry_msgs::Transform base2odom = tf2::toMsg(m_base_to_odom);
+    odometry_msg.pose.pose.position.x = pose_msg.translation.x;
+    odometry_msg.pose.pose.position.y = pose_msg.translation.y;
+    odometry_msg.pose.pose.position.z = pose_msg.translation.z;
+    odometry_msg.pose.pose.orientation.x = pose_msg.rotation.x;
+    odometry_msg.pose.pose.orientation.y = pose_msg.rotation.y;
+    odometry_msg.pose.pose.orientation.z = pose_msg.rotation.z;
+    odometry_msg.pose.pose.orientation.w = pose_msg.rotation.w;
 
     if (!m_last_update_time.isZero())
     {
         double delta_t = (timestamp - m_last_update_time).toSec();
+        int x = 0;
         if (delta_t)
         {
-            odometry_msg.twist.twist.linear.x = delta_odom_base_tf.getOrigin().getX() / delta_t;
-            odometry_msg.twist.twist.linear.y = delta_odom_base_tf.getOrigin().getY() / delta_t;
-            odometry_msg.twist.twist.linear.z = delta_odom_base_tf.getOrigin().getZ() / delta_t;
-            tf2::Quaternion delta_rot = delta_odom_base_tf.getRotation();
+            // odometry_msg.twist.twist.linear.x = delta_odom_sensor_tf.getOrigin().getX() / delta_t;
+            // odometry_msg.twist.twist.linear.y = delta_odom_sensor_tf.getOrigin().getY() / delta_t;
+            // odometry_msg.twist.twist.linear.z = delta_odom_sensor_tf.getOrigin().getZ() / delta_t;
+            
+            odometry_msg.twist.twist.linear.x = pos_delta.z() / delta_t;
+            odometry_msg.twist.twist.linear.y = pos_delta.x() / delta_t;
+            odometry_msg.twist.twist.linear.z = -pos_delta.x() / delta_t;
+
+            tf2::Quaternion delta_rot = delta_odom_sensor_tf.getRotation();
             tf2Scalar angle = delta_rot.getAngle();
             tf2::Vector3 axis = delta_rot.getAxis();
             tf2::Vector3 angular_twist = axis * angle / delta_t;
@@ -309,11 +333,11 @@ void lvt_ros::on_stereo_image(
     transform_stamped.header.stamp = timestamp;
     transform_stamped.header.frame_id = m_odom_frame_id;
     transform_stamped.child_frame_id = m_baselink_frame_id;
-    transform_stamped.transform = tf2::toMsg(m_base_to_odom);
+    transform_stamped.transform = pose_msg; // tf2::toMsg(m_base_to_odom);
     m_tf_broadcaster.sendTransform(transform_stamped);
 
     m_last_update_time = timestamp;
-    m_last_rotation = current_rotation_mtrx;
+    m_last_rotation = current_q2;
     m_last_position = current_pos;
 }
 
